@@ -170,7 +170,7 @@ async def get_daily_pnl() -> float:
 
 async def place_order(signal: dict, lot_size: float) -> dict:
     """Place a market order on MT5 via MetaAPI."""
-    pair    = signal["pair"].replace("/", "")  # EURUSD
+    pair    = signal["pair"].replace("/", "") + "."  # EURUSD. — Soar Funding uses dot suffix
     dirn    = signal["direction"]
     entry   = signal["entry_price"]
     sl      = signal["stop_loss"]
