@@ -177,12 +177,13 @@ async def place_order(signal: dict, lot_size: float) -> dict:
     tp1     = signal["tp1"]
     tp2     = signal["tp2"]
 
-    action = "ORDER_TYPE_BUY" if dirn == "BUY" else "ORDER_TYPE_SELL"
+    action = "ORDER_TYPE_BUY_LIMIT" if dirn == "BUY" else "ORDER_TYPE_SELL_LIMIT"
 
     body = {
         "symbol":     pair,
         "actionType": action,
         "volume":     round(lot_size, 2),
+        "openPrice":  entry,   # limit order price
         "stopLoss":   sl,
         "takeProfit": tp1,   # TP1 first — we manage TP2 separately
         "comment":    "APEX_XAU_SIGNAL",
