@@ -374,6 +374,10 @@ def parse_signal_from_message(text: str) -> dict | None:
         rr_m = re.search(r"RR:\s*([\d.]+)(?::\d)?", text)
         s["rr_ratio"] = float(rr_m.group(1)) if rr_m else 2.0
 
+        # Position size recommended by APEX
+        size_m = re.search(r"Size:\s*([\d.]+)%", text)
+        s["position_size_pct"] = float(size_m.group(1)) if size_m else None
+
         # Session
         sess_m = re.search(r"(London|New York|Asian|Overlap)", text)
         s["session"] = sess_m.group(1) if sess_m else "Unknown"
@@ -514,8 +518,14 @@ async def process_signal(bot, signal: dict):
         return
 
     # 4. Calculate lot size
-    lot_size = calc_lot_size(pair, entry, sl, balance, MAX_RISK_PCT)
-    risk_usd = min(balance * MAX_RISK_PCT, MAX_RISK_USD)
+    # Use APEX's recommended position size, capped at 3% max
+    signal_size_pct = signal.get("position_size_pct")
+    if signal_size_pct and float(signal_size_pct) > 0:
+        risk_pct = min(float(signal_size_pct) / 100, MAX_RISK_PCT)
+    else:
+        risk_pct = MAX_RISK_PCT
+    lot_size = calc_lot_size(pair, entry, sl, balance, risk_pct)
+    risk_usd = min(balance * risk_pct, MAX_RISK_USD)
 
     # 5. Ask admin if within 1% of daily limit
     remaining_daily = MAX_DAILY_LOSS_USD - daily_loss
