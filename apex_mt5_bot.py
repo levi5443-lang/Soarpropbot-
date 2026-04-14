@@ -324,8 +324,11 @@ def parse_signal_from_message(text: str) -> dict | None:
     Parse a structured signal message from the XAU Signals bot.
     Expects the standard APEX signal format.
     """
-    if "APEX SIGNAL" not in text and "XAU SIGNAL" not in text:
+    # Strip markdown formatting before parsing
+    clean = text.replace("*", "").replace("_", "").replace("`", "")
+    if "APEX SIGNAL" not in clean and "XAU SIGNAL" not in clean:
         return None
+    text = clean  # use cleaned version for all parsing below
 
     try:
         s = {}
@@ -351,20 +354,20 @@ def parse_signal_from_message(text: str) -> dict | None:
         conf_m = re.search(r"Conf: ([\d.]+)/10", text)
         s["confidence"] = float(conf_m.group(1)) if conf_m else 5.0
 
-        # Entry
-        entry_m = re.search(r"Entry:\s*([\d.]+)", text)
+        # Entry (handle backtick-wrapped values from Markdown)
+        entry_m = re.search(r"Entry:\s*`?([\d.]+)`?", text)
         s["entry_price"] = float(entry_m.group(1)) if entry_m else None
 
         # Stop
-        stop_m = re.search(r"Stop:\s*([\d.]+)", text)
+        stop_m = re.search(r"Stop:\s*`?([\d.]+)`?", text)
         s["stop_loss"] = float(stop_m.group(1)) if stop_m else None
 
         # TP1
-        tp1_m = re.search(r"TP1[^:]*:\s*([\d.]+)", text)
+        tp1_m = re.search(r"TP1[^:]*:\s*`?([\d.]+)`?", text)
         s["tp1"] = float(tp1_m.group(1)) if tp1_m else None
 
         # TP2
-        tp2_m = re.search(r"TP2[^:]*:\s*([\d.]+)", text)
+        tp2_m = re.search(r"TP2[^:]*:\s*`?([\d.]+)`?", text)
         s["tp2"] = float(tp2_m.group(1)) if tp2_m else None
 
         # RR
@@ -877,13 +880,14 @@ async def handle_webhook(request):
 
         signal = parse_signal_from_message(signal_text)
         if signal:
-            log.info("Webhook signal received: " + signal.get("pair", "?") + " " + signal.get("direction", "?"))
+            log.info("Webhook signal received: " + signal.get("pair", "?") + " " + signal.get("direction", "?") + " Grade " + str(signal.get("grade")))
             SIGNAL_QUEUE.append(signal)
-            # Schedule flush
             asyncio.create_task(flush_queue_direct())
             return web.Response(status=200, text="OK")
         else:
-            log.info("Webhook: message received but no valid signal parsed")
+            # Log first 200 chars to see what arrived
+            preview = signal_text[:200].replace("\n", " ")
+            log.info("Webhook: no signal parsed. Text preview: " + preview)
             return web.Response(status=200, text="No signal")
 
     except Exception as e:
