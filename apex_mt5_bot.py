@@ -233,6 +233,80 @@ async def get_daily_pnl() -> float:
         return DAILY_CLOSED_PNL
 
 
+async def fetch_atr(pair: str, interval: str = "15min", period: int = 14) -> float | None:
+    """
+    Fetch ATR for a pair via Twelve Data.
+    Returns ATR value or None if unavailable.
+    Used to calculate dynamic slippage tolerance.
+    """
+    symbol = pair.replace(".", "")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                "https://api.twelvedata.com/atr",
+                params={
+                    "symbol":     symbol + "/USD" if "USD" not in symbol else symbol,
+                    "interval":   interval,
+                    "time_period": period,
+                    "outputsize": 1,
+                    "apikey":     TWELVE_DATA_KEY,
+                },
+                headers={"X-API-Version": "last"},
+            )
+            data = r.json()
+            values = data.get("values", [])
+            if values:
+                return float(values[0].get("atr", 0))
+    except Exception as e:
+        log.warning("fetch_atr error for " + pair + ": " + str(e))
+    return None
+
+
+def calc_pip_distance(pair: str, price_a: float, price_b: float) -> float:
+    """Calculate pip distance between two prices for a given pair."""
+    diff = abs(price_a - price_b)
+    if pair == "XAUUSD":
+        return diff * 10
+    if "JPY" in pair:
+        return diff * 100
+    return diff * 10000
+
+
+def atr_to_pips(pair: str, atr: float) -> float:
+    """Convert ATR value to pips for a given pair."""
+    if pair == "XAUUSD":
+        return atr * 10
+    if "JPY" in pair:
+        return atr * 100
+    return atr * 10000
+
+
+async def check_slippage_tolerance(pair: str, entry: float, current_price: float, direction: str) -> tuple[bool, str]:
+    """
+    Check if current price has moved too far from entry to justify market execution.
+    Tolerance = 0.5x ATR in pips.
+    Returns (ok_to_execute, reason_string)
+    """
+    atr = await fetch_atr(pair.replace(".", ""))
+    if atr is None:
+        # If ATR unavailable — allow execution with warning
+        log.warning("ATR unavailable for " + pair + " — allowing execution without slippage check")
+        return True, "ATR unavailable — executed without slippage check"
+
+    atr_pips      = atr_to_pips(pair.replace(".", ""), atr)
+    tolerance_pips = round(atr_pips * 0.5, 1)
+    slippage_pips  = calc_pip_distance(pair.replace(".", ""), entry, current_price)
+
+    if slippage_pips > tolerance_pips:
+        reason = (
+            "Slippage too large — price moved " + str(round(slippage_pips, 1)) + " pips from entry " +
+            str(entry) + " (ATR tolerance: " + str(tolerance_pips) + " pips). Trade skipped."
+        )
+        return False, reason
+
+    return True, "Within ATR tolerance (" + str(round(slippage_pips, 1)) + "/" + str(tolerance_pips) + " pips)"
+
+
 async def place_order(signal: dict, lot_size: float) -> dict:
     """Place a limit order on MT5 via MetaAPI. Falls back to market order if limit price is invalid."""
     pair        = signal["pair"].replace("/", "") + "."  # EURUSD. — Soar Funding uses dot suffix
@@ -252,18 +326,28 @@ async def place_order(signal: dict, lot_size: float) -> dict:
 
         if dirn == "BUY":
             if entry >= ask:
+                # Price moved past entry — check ATR slippage tolerance
+                ok, reason = await check_slippage_tolerance(pair, entry, ask, dirn)
+                if not ok:
+                    log.warning("BUY market skipped — " + reason)
+                    raise ValueError("SLIPPAGE_EXCEEDED: " + reason)
                 action     = "ORDER_TYPE_BUY"
                 open_price = ask
-                log.info("BUY LIMIT invalid (entry " + str(entry) + " >= ask " + str(ask) + ") — switching to market order")
+                log.info("BUY LIMIT invalid (entry " + str(entry) + " >= ask " + str(ask) + ") — within ATR tolerance, switching to market order")
             else:
                 action     = "ORDER_TYPE_BUY_LIMIT"
                 open_price = entry
                 log.info("BUY LIMIT valid (entry " + str(entry) + " < ask " + str(ask) + ") — placing limit order")
         else:
             if entry <= bid:
+                # Price moved past entry — check ATR slippage tolerance
+                ok, reason = await check_slippage_tolerance(pair, entry, bid, dirn)
+                if not ok:
+                    log.warning("SELL market skipped — " + reason)
+                    raise ValueError("SLIPPAGE_EXCEEDED: " + reason)
                 action     = "ORDER_TYPE_SELL"
                 open_price = bid
-                log.info("SELL LIMIT invalid (entry " + str(entry) + " <= bid " + str(bid) + ") — switching to market order")
+                log.info("SELL LIMIT invalid (entry " + str(entry) + " <= bid " + str(bid) + ") — within ATR tolerance, switching to market order")
             else:
                 action     = "ORDER_TYPE_SELL_LIMIT"
                 open_price = entry
@@ -799,17 +883,33 @@ async def execute_trade(bot, signal: dict, lot_size: float, risk_usd: float):
         log.info("Trade executed: " + pair + " " + dirn + " lots=" + str(lot_size))
 
     except Exception as e:
-        log.error("Trade execution error: " + str(e))
-        await bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=(
-                "⚠️ *TRADE EXCEPTION*\n\n" +
-                pair + " " + dirn + "\n" +
-                "*Error:* " + str(e) + "\n\n" +
-                "_Check Render logs for full traceback._"
-            ),
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        err_str = str(e)
+        if "SLIPPAGE_EXCEEDED" in err_str:
+            # Clean notification — not an error, just a skipped trade
+            reason = err_str.replace("SLIPPAGE_EXCEEDED: ", "")
+            log.info("Trade skipped — slippage: " + pair + " " + dirn)
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=(
+                    "⏭ *TRADE SKIPPED — Slippage*\n\n" +
+                    pair + " " + dirn + " - Grade " + str(signal.get("grade", "?")) + "\n\n" +
+                    reason + "\n\n" +
+                    "_Levz protected the account from a bad fill._"
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            log.error("Trade execution error: " + err_str)
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=(
+                    "⚠️ *TRADE EXCEPTION*\n\n" +
+                    pair + " " + dirn + "\n" +
+                    "*Error:* " + err_str + "\n\n" +
+                    "_Check Render logs for full traceback._"
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+            )
 
 
 # ── Telegram handlers ──────────────────────────────────────────────────────
