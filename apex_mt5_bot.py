@@ -235,7 +235,8 @@ async def get_daily_pnl() -> float:
 
 async def place_order(signal: dict, lot_size: float) -> dict:
     """Place a limit order on MT5 via MetaAPI. Falls back to market order if limit price is invalid."""
-    pair    = signal["pair"].replace("/", "") + "."  # EURUSD. — Soar Funding uses dot suffix
+    pair        = signal["pair"].replace("/", "") + "."  # EURUSD. — Soar Funding uses dot suffix
+    pair_price  = signal["pair"].replace("/", "")        # EURUSD  — no dot for price API calls
     dirn    = signal["direction"]
     entry   = float(signal["entry_price"])
     sl      = float(signal["stop_loss"])
@@ -244,33 +245,29 @@ async def place_order(signal: dict, lot_size: float) -> dict:
 
     # Get current price to validate limit order direction
     try:
-        info     = await meta_get("/account-information")
-        # Fetch current bid/ask from positions or use entry as fallback
-        # Check if limit price is still valid
-        # BUY LIMIT: entry must be BELOW current ask
-        # SELL LIMIT: entry must be ABOVE current bid
-        positions = await meta_get("/symbols/" + pair + "/currentPrice")
+        info      = await meta_get("/account-information")
+        positions = await meta_get("/symbols/" + pair_price + "/currentPrice")
         ask = float(positions.get("ask", entry))
         bid = float(positions.get("bid", entry))
 
         if dirn == "BUY":
-            # If entry is already above current ask — price has moved past entry, use market
             if entry >= ask:
-                action    = "ORDER_TYPE_BUY"
+                action     = "ORDER_TYPE_BUY"
                 open_price = ask
                 log.info("BUY LIMIT invalid (entry " + str(entry) + " >= ask " + str(ask) + ") — switching to market order")
             else:
-                action    = "ORDER_TYPE_BUY_LIMIT"
+                action     = "ORDER_TYPE_BUY_LIMIT"
                 open_price = entry
+                log.info("BUY LIMIT valid (entry " + str(entry) + " < ask " + str(ask) + ") — placing limit order")
         else:
-            # If entry is already below current bid — price has moved past entry, use market
             if entry <= bid:
-                action    = "ORDER_TYPE_SELL"
+                action     = "ORDER_TYPE_SELL"
                 open_price = bid
                 log.info("SELL LIMIT invalid (entry " + str(entry) + " <= bid " + str(bid) + ") — switching to market order")
             else:
-                action    = "ORDER_TYPE_SELL_LIMIT"
+                action     = "ORDER_TYPE_SELL_LIMIT"
                 open_price = entry
+                log.info("SELL LIMIT valid (entry " + str(entry) + " > bid " + str(bid) + ") — placing limit order")
     except Exception as e:
         log.warning("Price validation failed, using limit order: " + str(e))
         action     = "ORDER_TYPE_BUY_LIMIT" if dirn == "BUY" else "ORDER_TYPE_SELL_LIMIT"
@@ -287,7 +284,8 @@ async def place_order(signal: dict, lot_size: float) -> dict:
     }
 
     result = await meta_post("/trade", body)
-    log.info("Order placed: " + str(result))
+    log.info("Order body sent: " + str(body))
+    log.info("Order result: " + str(result))
     return result
 
 
@@ -687,10 +685,64 @@ async def execute_trade(bot, signal: dict, lot_size: float, risk_usd: float):
         balance = ACCOUNT_BALANCE_START
 
     try:
-        result = await place_order(signal, lot_size)
+        result   = await place_order(signal, lot_size)
         order_id = result.get("orderId", "unknown")
 
-        # Log the trade
+        # ── Detect failed orders ───────────────────────────────────────────
+        # MetaAPI returns error details in result if order was rejected
+        error_msg    = result.get("message", "") or result.get("error", "") or result.get("description", "")
+        error_code   = result.get("numericCode", "") or result.get("stringCode", "")
+        order_failed = (
+            order_id == "unknown" and not result.get("positionId")
+        ) or result.get("error") or "error" in str(result).lower()
+
+        if order_failed:
+            # Build detailed failure reason
+            reason = "Unknown reason"
+            if error_msg:
+                reason = str(error_msg)
+            elif error_code:
+                reason = "Error code: " + str(error_code)
+            elif order_id == "unknown":
+                reason = "No order ID returned — order may have been rejected by broker"
+
+            log.error("Order FAILED: " + pair + " " + dirn + " — " + reason)
+
+            # Get current price for diagnostics
+            try:
+                positions = await meta_get("/symbols/" + pair.replace("/","").replace(".","") + "/currentPrice")
+                ask = positions.get("ask", "n/a")
+                bid = positions.get("bid", "n/a")
+                price_info = "Ask: " + str(ask) + " | Bid: " + str(bid)
+            except Exception:
+                price_info = "Price unavailable"
+
+            # Get account info for margin diagnostics
+            try:
+                acct = await get_account_info()
+                margin_free = acct.get("freeMargin", "n/a")
+                margin_info = "Free margin: $" + str(round(float(margin_free), 2)) if margin_free != "n/a" else "Margin unavailable"
+            except Exception:
+                margin_info = "Margin unavailable"
+
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=(
+                    "⚠️ *ORDER FAILED*\n\n" +
+                    pair + " " + dirn + " - Grade " + str(signal.get("grade")) + "\n\n" +
+                    "*Reason:* " + reason + "\n"
+                    "*Entry attempted:* " + str(entry) + "\n" +
+                    "*" + price_info + "*\n" +
+                    "*Lot size:* " + str(lot_size) + "\n" +
+                    "*Risk:* $" + str(round(risk_usd, 2)) + "\n" +
+                    "*" + margin_info + "*\n\n" +
+                    "_Full result: " + str(result)[:200] + "_"
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        # ── Successful order ───────────────────────────────────────────────
         executed_at = datetime.utcnow().isoformat()
         TRADE_LOG.append({
             "signal_id":    signal.get("signal_id"),
@@ -750,7 +802,12 @@ async def execute_trade(bot, signal: dict, lot_size: float, risk_usd: float):
         log.error("Trade execution error: " + str(e))
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text="TRADE FAILED — " + pair + " " + dirn + "\nError: " + str(e),
+            text=(
+                "⚠️ *TRADE EXCEPTION*\n\n" +
+                pair + " " + dirn + "\n" +
+                "*Error:* " + str(e) + "\n\n" +
+                "_Check Render logs for full traceback._"
+            ),
             parse_mode=ParseMode.MARKDOWN,
         )
 
@@ -1181,20 +1238,12 @@ async def handle_webhook(request):
 
         signal = parse_signal_from_message(signal_text)
         if signal:
-            # Inject entry range from payload if provided by Levz
-            # Use midpoint as the order placement price instead of exact entry
-            if data.get("entry_midpoint"):
-                signal["entry_price"] = data["entry_midpoint"]
-                signal["entry_range_low"]  = data.get("entry_range_low")
-                signal["entry_range_high"] = data.get("entry_range_high")
-                log.info("Entry midpoint applied: " + str(data["entry_midpoint"]) +
-                         " (zone: " + str(data.get("entry_range_low")) +
-                         " — " + str(data.get("entry_range_high")) + ")")
             log.info("Webhook signal received: " + signal.get("pair", "?") + " " + signal.get("direction", "?") + " Grade " + str(signal.get("grade")))
             SIGNAL_QUEUE.append(signal)
             asyncio.create_task(flush_queue_direct())
             return web.Response(status=200, text="OK")
         else:
+            # Log first 200 chars to see what arrived
             preview = signal_text[:200].replace("\n", " ")
             log.info("Webhook: no signal parsed. Text preview: " + preview)
             return web.Response(status=200, text="No signal")
