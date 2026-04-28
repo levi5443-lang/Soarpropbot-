@@ -119,13 +119,14 @@ def dynamic_limits(balance: float) -> dict:
 
 # ── Legacy constants — calculated from default starting balance ────────────
 # Used by single-account functions that haven't been migrated yet
-_DEFAULT_BALANCE   = float(os.environ.get("ACCOUNT_1_BALANCE", "10000"))
-MAX_RISK_PCT       = 0.01
-MAX_RISK_USD       = _DEFAULT_BALANCE * MAX_RISK_PCT
-MAX_DAILY_LOSS_USD = _DEFAULT_BALANCE * MAX_DAILY_LOSS_PCT
-MAX_TOTAL_LOSS_USD = _DEFAULT_BALANCE * MAX_TOTAL_LOSS_PCT
-ALERT_DAILY_USD    = _DEFAULT_BALANCE * (MAX_DAILY_LOSS_PCT - ALERT_BUFFER_PCT)
-ALERT_TOTAL_USD    = _DEFAULT_BALANCE * (MAX_TOTAL_LOSS_PCT - ALERT_BUFFER_PCT)
+_DEFAULT_BALANCE      = float(os.environ.get("ACCOUNT_1_BALANCE", "10000"))
+ACCOUNT_BALANCE_START = _DEFAULT_BALANCE   # alias — keeps legacy references working
+MAX_RISK_PCT          = 0.01
+MAX_RISK_USD          = _DEFAULT_BALANCE * MAX_RISK_PCT
+MAX_DAILY_LOSS_USD    = _DEFAULT_BALANCE * MAX_DAILY_LOSS_PCT
+MAX_TOTAL_LOSS_USD    = _DEFAULT_BALANCE * MAX_TOTAL_LOSS_PCT
+ALERT_DAILY_USD       = _DEFAULT_BALANCE * (MAX_DAILY_LOSS_PCT - ALERT_BUFFER_PCT)
+ALERT_TOTAL_USD       = _DEFAULT_BALANCE * (MAX_TOTAL_LOSS_PCT - ALERT_BUFFER_PCT)
 
 UTC = ZoneInfo("UTC")
 META_BASE = "https://mt-client-api-v1.london.agiliumtrade.ai"
@@ -144,7 +145,7 @@ ACCOUNT_DAILY_PNL: dict = {}
 
 def check_daily_reset_for(account_id: str):
     """Reset daily P&L for a specific account at midnight UTC."""
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
     if account_id not in ACCOUNT_DAILY_PNL:
         ACCOUNT_DAILY_PNL[account_id] = {"pnl": 0.0, "date": today}
     elif ACCOUNT_DAILY_PNL[account_id]["date"] != today:
@@ -541,7 +542,7 @@ async def check_drawdown_limits(bot) -> tuple[bool, str]:
 
     balance   = info["balance"]
     daily_loss = abs(min(daily_pnl, 0))    # only losses count
-    total_loss = max(0, ACCOUNT_BALANCE_START - balance)
+    total_loss = max(0, max(ACCOUNT_BALANCE_START, balance) - balance)
 
     # Hard blocks
     if daily_loss >= MAX_DAILY_LOSS_USD:
@@ -688,9 +689,9 @@ def parse_signal_from_message(text: str) -> dict | None:
                     time_m.group(1) + " " + time_m.group(2), "%H:%M %d %b %Y"
                 ).isoformat()
             except Exception:
-                s["fired_at"] = datetime.utcnow().isoformat()
+                s["fired_at"] = datetime.now(UTC).isoformat()
         else:
-            s["fired_at"] = datetime.utcnow().isoformat()
+            s["fired_at"] = datetime.now(UTC).isoformat()
 
         # Session
         sess_m = re.search(r"(London|New York|Asian|Overlap)", text)
@@ -701,8 +702,8 @@ def parse_signal_from_message(text: str) -> dict | None:
         if not all(s.get(k) for k in required):
             return None
 
-        s["signal_id"] = s["pair"] + "_" + datetime.utcnow().strftime("%Y%m%d%H%M%S")
-        s["received_at"] = datetime.utcnow().isoformat()
+        s["signal_id"] = s["pair"] + "_" + datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        s["received_at"] = datetime.now(UTC).isoformat()
         return s
 
     except Exception as e:
@@ -813,7 +814,7 @@ async def process_signal(bot, signal: dict):
     balance    = info["balance"]
     lim        = dynamic_limits(balance)
     daily_loss = abs(min(daily_pnl, 0))
-    total_loss = max(0, ACCOUNT_BALANCE_START - balance)
+    total_loss = max(0, max(ACCOUNT_BALANCE_START, balance) - balance)
 
     # Hard blocks
     if daily_loss >= lim["max_daily_usd"]:
@@ -949,7 +950,7 @@ async def execute_trade(bot, signal: dict, lot_size: float, risk_usd: float):
             return
 
         # ── Successful order ───────────────────────────────────────────────
-        executed_at = datetime.utcnow().isoformat()
+        executed_at = datetime.now(UTC).isoformat()
         TRADE_LOG.append({
             "signal_id":    signal.get("signal_id"),
             "pair":         pair,
@@ -975,7 +976,7 @@ async def execute_trade(bot, signal: dict, lot_size: float, risk_usd: float):
         })
 
         signal_time = signal.get("fired_at", "")
-        exec_time   = datetime.utcnow().strftime("%H:%M UTC")
+        exec_time   = datetime.now(UTC).strftime("%H:%M UTC")
         if signal_time:
             try:
                 fired_dt   = datetime.fromisoformat(signal_time.replace("Z", "+00:00"))
@@ -1119,7 +1120,7 @@ async def execute_signal_for_account(bot, signal: dict, account: dict):
             "lots":         lot_size,
             "risk_usd":     risk_usd,
             "order_id":     order_id,
-            "executed_at":  datetime.utcnow().isoformat(),
+            "executed_at":  datetime.now(UTC).isoformat(),
             "status":       "OPEN",
         })
 
@@ -1270,7 +1271,7 @@ async def cmd_account(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     balance    = info["balance"]
     lim        = dynamic_limits(balance)
     daily_loss = abs(min(daily_pnl, 0))
-    total_loss = max(0, ACCOUNT_BALANCE_START - balance)
+    total_loss = max(0, max(ACCOUNT_BALANCE_START, balance) - balance)
 
     daily_pct = daily_loss / lim["max_daily_usd"] * 100 if lim["max_daily_usd"] else 0
     total_pct = total_loss / lim["max_total_usd"] * 100 if lim["max_total_usd"] else 0
@@ -1342,7 +1343,7 @@ async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID):
         return
-    today = datetime.utcnow().date().isoformat()
+    today = datetime.now(UTC).date().isoformat()
     today_trades = [t for t in TRADE_LOG if t.get("executed_at", "").startswith(today)]
     if not today_trades:
         await update.message.reply_text("No trades executed today.")
@@ -1436,7 +1437,7 @@ async def monitor_breakeven(ctx: ContextTypes.DEFAULT_TYPE):
                 pnl_usd = pnl_pips * calc_pip_value(pair) * trade.get("lots", 0.01)
                 trade["status"]     = "CLOSED"
                 trade["closed_pnl"] = round(pnl_usd, 2)
-                closed_at           = datetime.utcnow()
+                closed_at           = datetime.now(UTC)
                 trade["closed_at"]  = closed_at.isoformat()
                 record_closed_pnl(pnl_usd)
 
@@ -1536,7 +1537,7 @@ async def monitor_order_expiry(ctx: ContextTypes.DEFAULT_TYPE):
     if not pending_trades:
         return
 
-    now = datetime.utcnow()
+    now = datetime.now(UTC)
 
     # Get live pending orders from MetaAPI to confirm what's still open
     live_orders = await get_pending_orders()
@@ -1633,7 +1634,7 @@ async def flush_queue_direct():
         return
 
     # Weekend guard
-    now_utc = datetime.utcnow()
+    now_utc = datetime.now(UTC)
     weekday = now_utc.weekday()
     if weekday == 5 or weekday == 6 or (weekday == 4 and now_utc.hour >= 22):
         log.info("Weekend — market closed. Signal queue not executed.")
