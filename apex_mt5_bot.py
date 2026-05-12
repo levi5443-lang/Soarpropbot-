@@ -5,7 +5,7 @@ on a Soar Funding MT5 account with full rule compliance.
 
 Rules enforced:
 - Max 3% risk per trade ($300 on $10k account)
-- Daily drawdown limit: 4% ($400) — alerts at 3% ($300 used)
+- Daily drawdown limit: 3% — alerts at 2% used
 - Total drawdown limit: 8% ($800) — alerts at 7% ($700 used)
 - News window: blocks trades 5 min before/after high-impact events
 - Asks admin before trading when drawdown is close
@@ -83,7 +83,7 @@ def load_accounts() -> list:
 ACCOUNTS = load_accounts()
 
 # ── Risk settings ──────────────────────────────────────────────────────────
-MAX_DAILY_LOSS_PCT  = 0.04
+MAX_DAILY_LOSS_PCT  = 0.03
 MAX_TOTAL_LOSS_PCT  = 0.08
 ALERT_BUFFER_PCT    = 0.01
 
